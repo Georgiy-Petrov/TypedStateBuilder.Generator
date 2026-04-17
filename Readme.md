@@ -4,6 +4,8 @@ A Roslyn incremental source generator that produces **compile-time safe builders
 
 It takes a **builder template** and generates the boilerplate needed for a strongly-typed, guided construction API where correctness is enforced by the compiler - not by runtime checks or conventions.
 
+[![NuGet](https://img.shields.io/nuget/v/TypedStateBuilder.Generator.svg?logo=nuget)](https://www.nuget.org/packages/TypedStateBuilder.Generator)
+
 ---
 
 ## Table of Contents
