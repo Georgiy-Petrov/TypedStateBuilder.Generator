@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="TypedStateBuilder/TypedStateBuilder.Generator/TypedStateBuilder.Generator.csproj" />
+  <Project Path="TypedStateBuilder/TypedStateBuilder.Sample/TypedStateBuilder.Sample.csproj" />
+</Solution>
