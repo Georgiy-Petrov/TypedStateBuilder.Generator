@@ -227,6 +227,21 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
                 diagnostics,
                 cancellationToken);
 
+            var overloads = ReadStepOverloads(
+                compilation,
+                member,
+                GetStepOverloadAttributes(member, symbols),
+                diagnostics,
+                cancellationToken);
+
+            ValidateStepMethodSignatureCollisions(
+                member,
+                builder,
+                stepName,
+                member.Type,
+                overloads,
+                diagnostics);
+
             stepFields.Add(new StepModel(
                 FieldName: member.Name,
                 FieldTypeName: member.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
@@ -234,7 +249,8 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
                 MethodName: stepName,
                 Default: defaultModel,
                 IsRequired: defaultModel is null,
-                Validators: validators));
+                Validators: validators,
+                Overloads: overloads));
         }
 
         if (stepFields.Count == 0)
@@ -304,6 +320,7 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
         return new KnownSymbols(
             BuildAttribute: compilation.GetTypeByMetadataName("TypedStateBuilder.BuildAttribute"),
             StepForValueAttribute: compilation.GetTypeByMetadataName("TypedStateBuilder.StepForValueAttribute"),
+            StepOverloadAttribute: compilation.GetTypeByMetadataName("TypedStateBuilder.StepOverloadAttribute"),
             ValidateValueAttribute: compilation.GetTypeByMetadataName("TypedStateBuilder.ValidateValueAttribute"),
             TaskType: compilation.GetTypeByMetadataName("System.Threading.Tasks.Task"));
     }
@@ -340,6 +357,24 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
 
             if (symbols.ValidateValueAttribute is not null &&
                 SymbolEqualityComparer.Default.Equals(attributeClass, symbols.ValidateValueAttribute))
+            {
+                yield return attribute;
+            }
+        }
+    }
+
+    private static IEnumerable<AttributeData> GetStepOverloadAttributes(IFieldSymbol field, KnownSymbols symbols)
+    {
+        foreach (var attribute in field.GetAttributes())
+        {
+            var attributeClass = attribute.AttributeClass;
+            if (attributeClass is null)
+            {
+                continue;
+            }
+
+            if (symbols.StepOverloadAttribute is not null &&
+                SymbolEqualityComparer.Default.Equals(attributeClass, symbols.StepOverloadAttribute))
             {
                 yield return attribute;
             }
@@ -635,6 +670,134 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
         return validators.ToEquatableArray();
     }
 
+    private static EquatableArray<StepOverloadModel> ReadStepOverloads(
+        Compilation compilation,
+        IFieldSymbol field,
+        IEnumerable<AttributeData> attributes,
+        List<Diagnostic> diagnostics,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var overloads = new List<StepOverloadModel>();
+
+        foreach (var attribute in attributes)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (attribute.ConstructorArguments.Length != 1)
+            {
+                diagnostics.Add(Diagnostic.Create(
+                    Diagnostics.InvalidStepOverloadMember,
+                    field.Locations.FirstOrDefault(),
+                    field.Name,
+                    field.ContainingType.Name,
+                    string.Empty,
+                    "step overload form must specify exactly one nameof(...) argument"));
+                continue;
+            }
+
+            if (!TryGetSingleNameofArgumentSyntax(attribute, out var nameofArgumentExpression))
+            {
+                diagnostics.Add(Diagnostic.Create(
+                    Diagnostics.InvalidStepOverloadSyntax,
+                    field.Locations.FirstOrDefault(),
+                    field.Name,
+                    field.ContainingType.Name));
+                continue;
+            }
+
+            var overloadName = attribute.ConstructorArguments[0].Value as string;
+            if (string.IsNullOrWhiteSpace(overloadName))
+            {
+                diagnostics.Add(Diagnostic.Create(
+                    Diagnostics.InvalidStepOverloadMember,
+                    field.Locations.FirstOrDefault(),
+                    field.Name,
+                    field.ContainingType.Name,
+                    string.Empty,
+                    "step overload member name is empty"));
+                continue;
+            }
+
+            var overloadMethod = ResolveStepOverloadMethod(
+                compilation,
+                field,
+                overloadName,
+                nameofArgumentExpression,
+                diagnostics,
+                cancellationToken);
+
+            if (overloadMethod is null)
+            {
+                continue;
+            }
+
+            overloads.Add(new StepOverloadModel(
+                Name: overloadMethod.Name,
+                IsStatic: overloadMethod.IsStatic,
+                Parameters: overloadMethod.Parameters.Select(CreateParameterModel).ToEquatableArray(),
+                SignatureKey: CreateMethodSignatureKey(overloadMethod),
+                DisplayName: overloadMethod.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat)));
+        }
+
+        return overloads
+            .Distinct()
+            .ToEquatableArray();
+    }
+
+    private static void ValidateStepMethodSignatureCollisions(
+        IFieldSymbol field,
+        INamedTypeSymbol builder,
+        string stepMethodName,
+        ITypeSymbol fieldType,
+        EquatableArray<StepOverloadModel> overloads,
+        List<Diagnostic> diagnostics)
+    {
+        var parameterlessOverloads = overloads
+            .Where(static o => o.Parameters.Count == 0)
+            .ToArray();
+
+        if (parameterlessOverloads.Length > 1)
+        {
+            diagnostics.Add(Diagnostic.Create(
+                Diagnostics.DuplicateParameterlessStepOverloadMethod,
+                field.Locations.FirstOrDefault(),
+                field.Name,
+                builder.Name,
+                stepMethodName,
+                string.Join(", ", parameterlessOverloads.Select(static o => o.DisplayName))));
+        }
+
+        var signatures = new HashSet<string>(StringComparer.Ordinal);
+
+        var baseSignature = CreateMethodSignatureKey(
+            stepMethodName,
+            new[] { new ParameterModel(
+                Name: "value",
+                TypeName: fieldType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+                RefKind: ParameterRefKind.None,
+                HasExplicitDefaultValue: false,
+                DefaultValueExpression: null)}.ToEquatableArray());
+
+        signatures.Add(baseSignature);
+
+        foreach (var overload in overloads)
+        {
+            var overloadSignature = CreateMethodSignatureKey(stepMethodName, overload.Parameters);
+            if (!signatures.Add(overloadSignature))
+            {
+                diagnostics.Add(Diagnostic.Create(
+                    Diagnostics.DuplicateStepOverloadMethod,
+                    field.Locations.FirstOrDefault(),
+                    field.Name,
+                    builder.Name,
+                    stepMethodName,
+                    overload.DisplayName));
+            }
+        }
+    }
+
     private static bool TryGetSingleNameofArgumentSyntax(
         AttributeData attribute,
         out ExpressionSyntax? nameofArgumentExpression)
@@ -908,6 +1071,121 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
         return method;
     }
 
+    private static IMethodSymbol? ResolveStepOverloadMethod(
+        Compilation compilation,
+        IFieldSymbol field,
+        string overloadName,
+        ExpressionSyntax nameofArgumentExpression,
+        List<Diagnostic> diagnostics,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var builder = field.ContainingType;
+        var semanticModel = compilation.GetSemanticModel(nameofArgumentExpression.SyntaxTree);
+        var symbolInfo = semanticModel.GetSymbolInfo(nameofArgumentExpression, cancellationToken);
+
+        var referencedMethods = new List<IMethodSymbol>();
+
+        if (symbolInfo.Symbol is IMethodSymbol directMethod && directMethod.MethodKind == MethodKind.Ordinary)
+        {
+            referencedMethods.Add(directMethod);
+        }
+
+        foreach (var candidate in symbolInfo.CandidateSymbols.OfType<IMethodSymbol>())
+        {
+            if (candidate.MethodKind == MethodKind.Ordinary)
+            {
+                referencedMethods.Add(candidate);
+            }
+        }
+
+        referencedMethods = referencedMethods
+            .GroupBy(static m => (ISymbol)m, SymbolEqualityComparer.Default)
+            .Select(static g => (IMethodSymbol)g.Key)
+            .ToList();
+
+        if (referencedMethods.Count == 0)
+        {
+            diagnostics.Add(Diagnostic.Create(
+                Diagnostics.InvalidStepOverloadMember,
+                field.Locations.FirstOrDefault(),
+                field.Name,
+                builder.Name,
+                overloadName,
+                "nameof(...) must reference a method declared on the builder class"));
+            return null;
+        }
+
+        if (referencedMethods.Any(m => !SymbolEqualityComparer.Default.Equals(m.ContainingType, builder)))
+        {
+            diagnostics.Add(Diagnostic.Create(
+                Diagnostics.InvalidStepOverloadMember,
+                field.Locations.FirstOrDefault(),
+                field.Name,
+                builder.Name,
+                overloadName,
+                "step overload method must be declared on the builder class itself"));
+            return null;
+        }
+
+        var methodsByName = builder.GetMembers(overloadName)
+            .OfType<IMethodSymbol>()
+            .Where(static m => m.MethodKind == MethodKind.Ordinary)
+            .Where(m => SymbolEqualityComparer.Default.Equals(m.ContainingType, builder))
+            .ToArray();
+
+        var validMethods = methodsByName
+            .Where(static m => m.TypeParameters.Length == 0)
+            .Where(m => SymbolEqualityComparer.Default.Equals(m.ReturnType, field.Type))
+            .ToArray();
+
+        if (validMethods.Length == 0)
+        {
+            diagnostics.Add(Diagnostic.Create(
+                Diagnostics.InvalidStepOverloadMember,
+                field.Locations.FirstOrDefault(),
+                field.Name,
+                builder.Name,
+                overloadName,
+                $"method must be non-generic and return '{field.Type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat)}'"));
+            return null;
+        }
+
+        var matchingReferencedMethods = validMethods
+            .Where(method =>
+                referencedMethods.Any(m =>
+                    SymbolEqualityComparer.Default.Equals(m.OriginalDefinition, method.OriginalDefinition) ||
+                    SymbolEqualityComparer.Default.Equals(m, method)))
+            .ToArray();
+
+        if (matchingReferencedMethods.Length == 0)
+        {
+            diagnostics.Add(Diagnostic.Create(
+                Diagnostics.InvalidStepOverloadMember,
+                field.Locations.FirstOrDefault(),
+                field.Name,
+                builder.Name,
+                overloadName,
+                "nameof(...) must reference the exact overload method used for step generation"));
+            return null;
+        }
+
+        if (matchingReferencedMethods.Length > 1)
+        {
+            diagnostics.Add(Diagnostic.Create(
+                Diagnostics.InvalidStepOverloadMember,
+                field.Locations.FirstOrDefault(),
+                field.Name,
+                builder.Name,
+                overloadName,
+                "multiple matching overload methods with this name were found on the builder class"));
+            return null;
+        }
+
+        return matchingReferencedMethods[0];
+    }
+
     private static bool IsSupportedValidatorReturnType(ITypeSymbol returnType, KnownSymbols symbols)
     {
         if (returnType.SpecialType == SpecialType.System_Void)
@@ -1061,6 +1339,36 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
             }
         }
 
+        foreach (var step in model.Steps)
+        {
+            for (var i = 0; i < step.Overloads.Count; i++)
+            {
+                var overload = step.Overloads.AsSpan()[i];
+
+                sb.Append("    [UnsafeAccessor(UnsafeAccessorKind.")
+                    .Append(overload.IsStatic ? "StaticMethod" : "Method")
+                    .Append(", Name = ")
+                    .Append(SymbolDisplay.FormatLiteral(overload.Name, quote: true))
+                    .AppendLine(")]");
+
+                sb.Append("    internal static extern ")
+                    .Append(step.FieldTypeName)
+                    .Append(' ')
+                    .Append(GetStepOverloadAccessorName(step, overload, i))
+                    .Append('(')
+                    .Append(model.BuilderFullyQualifiedName)
+                    .Append(" owner");
+
+                foreach (var parameter in overload.Parameters)
+                {
+                    sb.Append(", ").Append(ParameterDeclaration(parameter, includeDefaultValues: false));
+                }
+
+                sb.AppendLine(");");
+                sb.AppendLine();
+            }
+        }
+
         foreach (var buildMethod in model.BuildMethods)
         {
             sb.AppendLine("    [UnsafeAccessor(UnsafeAccessorKind.Method)]");
@@ -1184,6 +1492,72 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
                 .AppendLine(">(builder.Inner);");
             sb.AppendLine("    }");
             sb.AppendLine();
+
+            for (var overloadIndex = 0; overloadIndex < step.Overloads.Count; overloadIndex++)
+            {
+                var overload = step.Overloads.AsSpan()[overloadIndex];
+
+                sb.Append("    internal static ")
+                    .Append(model.WrapperName)
+                    .Append('<')
+                    .Append(string.Join(", ", GetBuilderTypeArgsThenStates(model, outputStateArgs)))
+                    .Append("> ")
+                    .Append(GetStepOverloadCoreName(step, overload, overloadIndex));
+
+                if (stateTypeParameters.Length > 0)
+                {
+                    sb.Append('<').Append(string.Join(", ", stateTypeParameters)).Append('>');
+                }
+
+                sb.Append('(')
+                    .Append(model.WrapperName)
+                    .Append('<')
+                    .Append(string.Join(", ", GetBuilderTypeArgsThenStates(model, inputStateArgs)))
+                    .Append("> builder");
+
+                foreach (var parameter in overload.Parameters)
+                {
+                    sb.Append(", ").Append(ParameterDeclaration(parameter, includeDefaultValues: true));
+                }
+
+                sb.AppendLine(")");
+
+                foreach (var builderTypeConstraint in model.TypeParameterConstraints)
+                {
+                    sb.Append("    ").AppendLine(builderTypeConstraint);
+                }
+
+                foreach (var stateName in stateTypeParameters)
+                {
+                    sb.Append("    where ").Append(stateName).AppendLine(" : IValueState");
+                }
+
+                sb.AppendLine("    {");
+                sb.Append("        var value = ")
+                    .Append(GetAccessorTypeReference(model))
+                    .Append('.')
+                    .Append(GetStepOverloadAccessorName(step, overload, overloadIndex))
+                    .Append("(builder.Inner");
+
+                foreach (var parameter in overload.Parameters)
+                {
+                    sb.Append(", ").Append(ParameterInvocation(parameter));
+                }
+
+                sb.AppendLine(");");
+                sb.Append("        return ")
+                    .Append(step.MethodName)
+                    .Append("Core");
+
+                if (stateTypeParameters.Length > 0)
+                {
+                    sb.Append('<').Append(string.Join(", ", stateTypeParameters)).Append('>');
+                }
+
+                sb.AppendLine("(builder, value);");
+                sb.AppendLine("    }");
+                sb.AppendLine();
+            }
         }
     }
 
@@ -1287,6 +1661,7 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
                     sb.AppendLine("        catch (Exception ex)");
                     sb.AppendLine("        {");
                     sb.AppendLine("            (exceptions ??= new List<Exception>()).Add(ex);");
+                    sb.AppendLine();
                     sb.AppendLine("        }");
                     sb.AppendLine();
                 }
@@ -1500,6 +1875,71 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
 
             sb.AppendLine("(builder, value);");
             sb.AppendLine();
+
+            for (var overloadIndex = 0; overloadIndex < step.Overloads.Count; overloadIndex++)
+            {
+                var overload = step.Overloads.AsSpan()[overloadIndex];
+
+                sb.Append("    ")
+                    .Append(model.GeneratedAccessibility == GeneratedAccessibility.Public ? "public" : "internal")
+                    .Append(" static ")
+                    .Append(model.WrapperName)
+                    .Append('<')
+                    .Append(string.Join(", ", GetBuilderTypeArgsThenStates(model, outputStateArgs)))
+                    .Append("> ")
+                    .Append(step.MethodName);
+
+                if (extensionMethodTypeParameters.Count > 0)
+                {
+                    sb.Append('<').Append(string.Join(", ", extensionMethodTypeParameters)).Append('>');
+                }
+
+                sb.Append('(')
+                    .Append("this ")
+                    .Append(model.WrapperName)
+                    .Append('<')
+                    .Append(string.Join(", ", GetBuilderTypeArgsThenStates(model, inputStateArgs)))
+                    .Append("> builder");
+
+                foreach (var parameter in overload.Parameters)
+                {
+                    sb.Append(", ").Append(ParameterDeclaration(parameter, includeDefaultValues: true));
+                }
+
+                sb.AppendLine(")");
+
+                foreach (var builderTypeConstraint in model.TypeParameterConstraints)
+                {
+                    sb.Append("    ").AppendLine(builderTypeConstraint);
+                }
+
+                foreach (var stateName in stateTypeParameters)
+                {
+                    sb.Append("    where ").Append(stateName).AppendLine(" : IValueState");
+                }
+
+                sb.Append("        => ")
+                    .Append(model.WrapperName)
+                    .Append('<')
+                    .Append(string.Join(", ", GetBuilderTypeArgsThenStates(model, inputStateArgs)))
+                    .Append(">")
+                    .Append('.')
+                    .Append(GetStepOverloadCoreName(step, overload, overloadIndex));
+
+                if (stateTypeParameters.Length > 0)
+                {
+                    sb.Append('<').Append(string.Join(", ", stateTypeParameters)).Append('>');
+                }
+
+                sb.Append("(builder");
+                foreach (var parameter in overload.Parameters)
+                {
+                    sb.Append(", ").Append(ParameterInvocation(parameter));
+                }
+
+                sb.AppendLine(");");
+                sb.AppendLine();
+            }
         }
     }
 
@@ -1820,6 +2260,33 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
         return sb.ToString();
     }
 
+    private static string CreateMethodSignatureKey(IMethodSymbol method)
+        => CreateMethodSignatureKey(
+            method.Name,
+            method.Parameters.Select(CreateParameterModel).ToEquatableArray());
+
+    private static string CreateMethodSignatureKey(string methodName, EquatableArray<ParameterModel> parameters)
+    {
+        var sb = new StringBuilder();
+        sb.Append(methodName).Append('(');
+
+        for (var i = 0; i < parameters.Count; i++)
+        {
+            if (i > 0)
+            {
+                sb.Append(',');
+            }
+
+            var parameter = parameters.AsSpan()[i];
+            sb.Append((int)parameter.RefKind)
+                .Append(':')
+                .Append(parameter.TypeName);
+        }
+
+        sb.Append(')');
+        return sb.ToString();
+    }
+
     private static string GetAccessorConstructorSuffix(EquatableArray<ParameterModel> parameters)
     {
         if (parameters.Count == 0)
@@ -1860,6 +2327,12 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
 
     private static string GetValidatorAccessorName(StepModel step, ValidatorModel validator, int index)
         => "Validate_" + SanitizeIdentifier(step.MethodName + "_" + validator.Name + "_" + index.ToString(CultureInfo.InvariantCulture));
+
+    private static string GetStepOverloadAccessorName(StepModel step, StepOverloadModel overload, int index)
+        => "Overload_" + SanitizeIdentifier(step.MethodName + "_" + overload.Name + "_" + index.ToString(CultureInfo.InvariantCulture));
+
+    private static string GetStepOverloadCoreName(StepModel step, StepOverloadModel overload, int index)
+        => "SetFrom_" + SanitizeIdentifier(step.MethodName + "_" + overload.Name + "_" + index.ToString(CultureInfo.InvariantCulture)) + "Core";
 
     private static string GetStepMethodName(string fieldName)
     {
@@ -1993,6 +2466,14 @@ public class StepForValueAttribute : Attribute
 }
 
 [AttributeUsage(AttributeTargets.Field, AllowMultiple = true, Inherited = false)]
+public sealed class StepOverloadAttribute : Attribute
+{
+    public StepOverloadAttribute(string overloadMemberName)
+    {
+    }
+}
+
+[AttributeUsage(AttributeTargets.Field, AllowMultiple = true, Inherited = false)]
 public sealed class ValidateValueAttribute : Attribute
 {
     public ValidateValueAttribute(string validatorMemberName)
@@ -2009,11 +2490,13 @@ public sealed class TypedStateBuilderAttribute : Attribute
     private readonly record struct KnownSymbols(
         INamedTypeSymbol? BuildAttribute,
         INamedTypeSymbol? StepForValueAttribute,
+        INamedTypeSymbol? StepOverloadAttribute,
         INamedTypeSymbol? ValidateValueAttribute,
         INamedTypeSymbol? TaskType)
     {
         public INamedTypeSymbol? BuildAttribute { get; } = BuildAttribute;
         public INamedTypeSymbol? StepForValueAttribute { get; } = StepForValueAttribute;
+        public INamedTypeSymbol? StepOverloadAttribute { get; } = StepOverloadAttribute;
         public INamedTypeSymbol? ValidateValueAttribute { get; } = ValidateValueAttribute;
         public INamedTypeSymbol? TaskType { get; } = TaskType;
     }
@@ -2119,7 +2602,8 @@ public sealed class TypedStateBuilderAttribute : Attribute
         string MethodName,
         DefaultModel? Default,
         bool IsRequired,
-        EquatableArray<ValidatorModel> Validators)
+        EquatableArray<ValidatorModel> Validators,
+        EquatableArray<StepOverloadModel> Overloads)
     {
         public string FieldName { get; } = FieldName;
         public string FieldTypeName { get; } = FieldTypeName;
@@ -2128,6 +2612,7 @@ public sealed class TypedStateBuilderAttribute : Attribute
         public DefaultModel? Default { get; } = Default;
         public bool IsRequired { get; } = IsRequired;
         public EquatableArray<ValidatorModel> Validators { get; } = Validators;
+        public EquatableArray<StepOverloadModel> Overloads { get; } = Overloads;
     }
 
     private readonly record struct DefaultModel(ProviderMethodModel ProviderMethod)
@@ -2146,6 +2631,20 @@ public sealed class TypedStateBuilderAttribute : Attribute
         public string Name { get; } = Name;
         public bool IsStatic { get; } = IsStatic;
         public ValidatorReturnKind ReturnKind { get; } = ReturnKind;
+    }
+
+    private readonly record struct StepOverloadModel(
+        string Name,
+        bool IsStatic,
+        EquatableArray<ParameterModel> Parameters,
+        string SignatureKey,
+        string DisplayName)
+    {
+        public string Name { get; } = Name;
+        public bool IsStatic { get; } = IsStatic;
+        public EquatableArray<ParameterModel> Parameters { get; } = Parameters;
+        public string SignatureKey { get; } = SignatureKey;
+        public string DisplayName { get; } = DisplayName;
     }
 
     private enum ParameterRefKind
@@ -2259,6 +2758,41 @@ public sealed class TypedStateBuilderAttribute : Attribute
             id: "TSB012",
             title: "Invalid validator member",
             messageFormat: "Field '{0}' on builder '{1}' specifies validator member '{2}', but it is invalid: {3}.",
+            category: "TypedStateBuilder",
+            defaultSeverity: DiagnosticSeverity.Error,
+            isEnabledByDefault: true);
+
+        public static readonly DiagnosticDescriptor InvalidStepOverloadSyntax = new(
+            id: "TSB013",
+            title: "Invalid step overload syntax",
+            messageFormat:
+            "Field '{0}' on builder '{1}' must use nameof(...) when specifying a step overload method.",
+            category: "TypedStateBuilder",
+            defaultSeverity: DiagnosticSeverity.Error,
+            isEnabledByDefault: true);
+
+        public static readonly DiagnosticDescriptor InvalidStepOverloadMember = new(
+            id: "TSB014",
+            title: "Invalid step overload member",
+            messageFormat: "Field '{0}' on builder '{1}' specifies step overload member '{2}', but it is invalid: {3}.",
+            category: "TypedStateBuilder",
+            defaultSeverity: DiagnosticSeverity.Error,
+            isEnabledByDefault: true);
+
+        public static readonly DiagnosticDescriptor DuplicateStepOverloadMethod = new(
+            id: "TSB015",
+            title: "Duplicate generated step overload method",
+            messageFormat:
+            "Field '{0}' on builder '{1}' would generate duplicate step overload method '{2}' from overload '{3}'.",
+            category: "TypedStateBuilder",
+            defaultSeverity: DiagnosticSeverity.Error,
+            isEnabledByDefault: true);
+
+        public static readonly DiagnosticDescriptor DuplicateParameterlessStepOverloadMethod = new(
+            id: "TSB016",
+            title: "Multiple parameterless step overloads are not supported",
+            messageFormat:
+            "Field '{0}' on builder '{1}' generates multiple parameterless overloads for step method '{2}': {3}. Only one parameterless [StepOverload] is allowed per step.",
             category: "TypedStateBuilder",
             defaultSeverity: DiagnosticSeverity.Error,
             isEnabledByDefault: true);

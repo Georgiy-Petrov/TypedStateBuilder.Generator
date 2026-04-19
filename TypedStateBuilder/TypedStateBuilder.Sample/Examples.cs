@@ -8,7 +8,7 @@ public class Program
     public static async Task Main()
     {
         var user = await TypedStateBuilders.CreateUserBuilder<string>().SetName("Alice")
-            .SetAge(30).Build();
+            .SetAge().Build();
 
         Console.WriteLine(user);
     }
@@ -166,10 +166,24 @@ internal class UserBuilder<T>
         }
     }
 
+    private int AgeFromString(string age)
+    {
+        return Int32.Parse(age);
+    }
+
+    private int AgeFromDefault()
+    {
+        return 30;
+    }
+
     [StepForValue] [ValidateValue(nameof(ValidateNameNotNull))] [ValidateValue(nameof(ValidateNameNotEmptyString))]
     public T _name;
 
-    [StepForValue] [ValidateValue(nameof(ValidateAgeNonNegative))] [ValidateValue(nameof(ValidateAgeReasonableAsync))]
+    [StepForValue]
+    [ValidateValue(nameof(ValidateAgeNonNegative))]
+    [ValidateValue(nameof(ValidateAgeReasonableAsync))]
+    [StepOverload(nameof(AgeFromString))]
+    [StepOverload(nameof(AgeFromDefault))]
     private int _age;
 
     [StepForValue(nameof(DefaultEmail))]
