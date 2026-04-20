@@ -9,7 +9,7 @@ public class Program
     {
         var user = await TypedStateBuilders.CreateUserBuilder<string>().SetName("Alice")
             .SetAge().Build();
-
+        
         Console.WriteLine(user);
     }
 }
@@ -195,3 +195,50 @@ internal class UserBuilder<T>
 }
 
 public sealed record User<T>(Guid Id, T Name, int Age, string Email);
+
+[TypedStateBuilder]
+public class VehicleBuilder
+{
+    [StepForValue]
+    [StepBranch("car")]
+    [ValidateValue(nameof(ValidateEngine))]
+    private string _engine;
+
+    [StepForValue(nameof(GetDefaultBatteryKwh))]
+    [StepBranch("car/electric")]
+    private int _batteryKwh;
+
+    [StepForValue]
+    [StepBranch("bike")]
+    private bool _hasBell;
+
+    [StepForValue]
+    [ValidateValue(nameof(ValidateColor))]
+    private string _color;
+
+    [Build("car")]
+    public string BuildCar()
+        => $"Car: engine={_engine}, color={_color}";
+
+    [Build("car/electric")]
+    public string BuildElectricCar()
+        => $"Electric car: battery={_batteryKwh}kWh, color={_color}";
+
+    [Build("bike")]
+    public string BuildBike()
+        => $"Bike: bell={_hasBell}, color={_color}";
+
+    private int GetDefaultBatteryKwh() => 75;
+
+    private void ValidateColor(string color)
+    {
+        if (string.IsNullOrWhiteSpace(color))
+            throw new ArgumentException("Color is required.", nameof(color));
+    }
+
+    private void ValidateEngine(string engine)
+    {
+        if (string.IsNullOrWhiteSpace(engine))
+            throw new ArgumentException("Engine is required.", nameof(engine));
+    }
+}

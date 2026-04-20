@@ -16,6 +16,10 @@ namespace TypedStateBuilder.Generator;
 [Generator(LanguageNames.CSharp)]
 public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerator
 {
+    private const string QualifiedIValueState = "global::TypedStateBuilder.IValueState";
+    private const string QualifiedValueSet = "global::TypedStateBuilder.ValueSet";
+    private const string QualifiedValueUnset = "global::TypedStateBuilder.ValueUnset";
+
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
         context.RegisterPostInitializationOutput(static ctx =>
@@ -148,7 +152,7 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
         var typeParameters = CreateTypeParameterModels(builder.TypeParameters);
         var typeParameterConstraints = BuildTypeParameterConstraints(typeParameters);
 
-        var buildMethods = GetBuildMethods(builder, symbols.BuildAttribute);
+        var buildMethods = GetBuildMethods(builder, symbols.BuildAttribute, diagnostics);
         if (buildMethods.Count == 0)
         {
             diagnostics.Add(Diagnostic.Create(
@@ -159,7 +163,8 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
         }
 
         var stepFields = new List<StepModel>();
-        var usedStateNames = new HashSet<string>(builder.TypeParameters.Select(static tp => tp.Name), StringComparer.Ordinal);
+        var usedStateNames =
+            new HashSet<string>(builder.TypeParameters.Select(static tp => tp.Name), StringComparer.Ordinal);
         var stepMethodNames = new HashSet<string>(StringComparer.Ordinal);
 
         foreach (var member in builder.GetMembers().OfType<IFieldSymbol>())
@@ -172,6 +177,18 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
             }
 
             var stepAttribute = GetStepAttribute(member, symbols);
+            var branchAttribute = GetStepBranchAttribute(member, symbols);
+
+            if (branchAttribute is not null && stepAttribute is null)
+            {
+                diagnostics.Add(Diagnostic.Create(
+                    Diagnostics.StepBranchRequiresStepForValue,
+                    member.Locations.FirstOrDefault(),
+                    member.Name,
+                    builder.Name));
+                continue;
+            }
+
             if (stepAttribute is null)
             {
                 continue;
@@ -212,6 +229,12 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
             var stateName = GetUniqueStateParameterName(member.Name, usedStateNames);
             usedStateNames.Add(stateName);
 
+            string? branchPath = null;
+            if (branchAttribute is not null)
+            {
+                branchPath = ReadBranchPath(member, branchAttribute, diagnostics);
+            }
+
             var defaultModel = ReadDefaultModel(
                 compilation,
                 member,
@@ -247,6 +270,7 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
                 FieldTypeName: member.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
                 StateName: stateName,
                 MethodName: stepName,
+                BranchPath: branchPath,
                 Default: defaultModel,
                 IsRequired: defaultModel is null,
                 Validators: validators,
@@ -260,6 +284,23 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
                 builder.Locations.FirstOrDefault(),
                 builder.Name));
             return null;
+        }
+
+        var hasBranchedSteps = stepFields.Any(static s => s.BranchPath is not null);
+
+        if (hasBranchedSteps)
+        {
+            foreach (var buildMethod in buildMethods)
+            {
+                if (string.IsNullOrWhiteSpace(buildMethod.TargetBranchPath))
+                {
+                    diagnostics.Add(Diagnostic.Create(
+                        Diagnostics.BranchedBuilderRequiresBuildTarget,
+                        builder.Locations.FirstOrDefault(),
+                        buildMethod.Name,
+                        builder.Name));
+                }
+            }
         }
 
         var constructors = GetConstructors(builder).ToEquatableArray();
@@ -321,6 +362,7 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
             BuildAttribute: compilation.GetTypeByMetadataName("TypedStateBuilder.BuildAttribute"),
             StepForValueAttribute: compilation.GetTypeByMetadataName("TypedStateBuilder.StepForValueAttribute"),
             StepOverloadAttribute: compilation.GetTypeByMetadataName("TypedStateBuilder.StepOverloadAttribute"),
+            StepBranchAttribute: compilation.GetTypeByMetadataName("TypedStateBuilder.StepBranchAttribute"),
             ValidateValueAttribute: compilation.GetTypeByMetadataName("TypedStateBuilder.ValidateValueAttribute"),
             TaskType: compilation.GetTypeByMetadataName("System.Threading.Tasks.Task"));
     }
@@ -337,6 +379,26 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
 
             if (symbols.StepForValueAttribute is not null &&
                 SymbolEqualityComparer.Default.Equals(attributeClass, symbols.StepForValueAttribute))
+            {
+                return attribute;
+            }
+        }
+
+        return null;
+    }
+
+    private static AttributeData? GetStepBranchAttribute(IFieldSymbol field, KnownSymbols symbols)
+    {
+        foreach (var attribute in field.GetAttributes())
+        {
+            var attributeClass = attribute.AttributeClass;
+            if (attributeClass is null)
+            {
+                continue;
+            }
+
+            if (symbols.StepBranchAttribute is not null &&
+                SymbolEqualityComparer.Default.Equals(attributeClass, symbols.StepBranchAttribute))
             {
                 return attribute;
             }
@@ -383,7 +445,8 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
 
     private static EquatableArray<BuildMethodModel> GetBuildMethods(
         INamedTypeSymbol builder,
-        INamedTypeSymbol? buildAttributeSymbol)
+        INamedTypeSymbol? buildAttributeSymbol,
+        List<Diagnostic> diagnostics)
     {
         var methods = new List<BuildMethodModel>();
 
@@ -399,23 +462,55 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
                 continue;
             }
 
-            var hasBuildAttribute = methodSymbol.GetAttributes().Any(a =>
-                a.AttributeClass is not null &&
-                buildAttributeSymbol is not null &&
-                SymbolEqualityComparer.Default.Equals(a.AttributeClass, buildAttributeSymbol));
-
-            if (!hasBuildAttribute)
+            foreach (var attribute in methodSymbol.GetAttributes())
             {
-                continue;
-            }
+                if (attribute.AttributeClass is null ||
+                    buildAttributeSymbol is null ||
+                    !SymbolEqualityComparer.Default.Equals(attribute.AttributeClass, buildAttributeSymbol))
+                {
+                    continue;
+                }
 
-            methods.Add(new BuildMethodModel(
-                Name: methodSymbol.Name,
-                ReturnTypeName: methodSymbol.ReturnType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
-                IsStatic: methodSymbol.IsStatic,
-                IsGenericMethod: methodSymbol.IsGenericMethod,
-                TypeParameters: CreateTypeParameterModels(methodSymbol.TypeParameters),
-                Parameters: methodSymbol.Parameters.Select(CreateParameterModel).ToEquatableArray()));
+                string? targetBranchPath = null;
+
+                if (attribute.ConstructorArguments.Length == 0)
+                {
+                    targetBranchPath = null;
+                }
+                else if (attribute.ConstructorArguments.Length == 1 &&
+                         attribute.ConstructorArguments[0].Value is string rawTarget)
+                {
+                    if (!TryNormalizeBranchPath(rawTarget, out targetBranchPath, out var error))
+                    {
+                        diagnostics.Add(Diagnostic.Create(
+                            Diagnostics.InvalidBuildBranchTarget,
+                            methodSymbol.Locations.FirstOrDefault(),
+                            methodSymbol.Name,
+                            builder.Name,
+                            error));
+                        continue;
+                    }
+                }
+                else
+                {
+                    diagnostics.Add(Diagnostic.Create(
+                        Diagnostics.InvalidBuildBranchTarget,
+                        methodSymbol.Locations.FirstOrDefault(),
+                        methodSymbol.Name,
+                        builder.Name,
+                        "build target must be omitted or be a single non-empty string path"));
+                    continue;
+                }
+
+                methods.Add(new BuildMethodModel(
+                    Name: methodSymbol.Name,
+                    ReturnTypeName: methodSymbol.ReturnType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+                    IsStatic: methodSymbol.IsStatic,
+                    IsGenericMethod: methodSymbol.IsGenericMethod,
+                    TargetBranchPath: targetBranchPath,
+                    TypeParameters: CreateTypeParameterModels(methodSymbol.TypeParameters),
+                    Parameters: methodSymbol.Parameters.Select(CreateParameterModel).ToEquatableArray()));
+            }
         }
 
         return methods
@@ -526,6 +621,37 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
             .Where(static tp => tp.Constraints.Count > 0)
             .Select(static tp => $"where {tp.Name} : {string.Join(", ", tp.Constraints)}")
             .ToEquatableArray();
+    }
+
+    private static string? ReadBranchPath(
+        IFieldSymbol field,
+        AttributeData attribute,
+        List<Diagnostic> diagnostics)
+    {
+        if (attribute.ConstructorArguments.Length != 1 ||
+            attribute.ConstructorArguments[0].Value is not string rawPath)
+        {
+            diagnostics.Add(Diagnostic.Create(
+                Diagnostics.InvalidStepBranchPath,
+                field.Locations.FirstOrDefault(),
+                field.Name,
+                field.ContainingType.Name,
+                "branch path must be a single non-empty string"));
+            return null;
+        }
+
+        if (!TryNormalizeBranchPath(rawPath, out var branchPath, out var error))
+        {
+            diagnostics.Add(Diagnostic.Create(
+                Diagnostics.InvalidStepBranchPath,
+                field.Locations.FirstOrDefault(),
+                field.Name,
+                field.ContainingType.Name,
+                error));
+            return null;
+        }
+
+        return branchPath;
     }
 
     private static DefaultModel? ReadDefaultModel(
@@ -773,12 +899,15 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
 
         var baseSignature = CreateMethodSignatureKey(
             stepMethodName,
-            new[] { new ParameterModel(
-                Name: "value",
-                TypeName: fieldType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
-                RefKind: ParameterRefKind.None,
-                HasExplicitDefaultValue: false,
-                DefaultValueExpression: null)}.ToEquatableArray());
+            new[]
+            {
+                new ParameterModel(
+                    Name: "value",
+                    TypeName: fieldType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+                    RefKind: ParameterRefKind.None,
+                    HasExplicitDefaultValue: false,
+                    DefaultValueExpression: null)
+            }.ToEquatableArray());
 
         signatures.Add(baseSignature);
 
@@ -1440,12 +1569,9 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
         for (var i = 0; i < model.Steps.Count; i++)
         {
             var step = model.Steps.AsSpan()[i];
-            var inputStateArgs = GetStateArgumentList(model, i, "ValueUnset");
-            var outputStateArgs = GetStateArgumentList(model, i, "ValueSet");
-            var stateTypeParameters = model.Steps
-                .Where((_, index) => index != i)
-                .Select(static s => s.StateName)
-                .ToArray();
+            var inputStateArgs = GetStepMethodInputStateArgs(model, i);
+            var outputStateArgs = GetStepMethodOutputStateArgs(model, i);
+            var stateTypeParameters = GetStepMethodTypeParameters(model, i);
 
             sb.Append("    internal static ")
                 .Append(model.WrapperName)
@@ -1469,14 +1595,9 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
                 .Append(" value)")
                 .AppendLine();
 
-            foreach (var builderTypeConstraint in model.TypeParameterConstraints)
-            {
-                sb.Append("    ").AppendLine(builderTypeConstraint);
-            }
-
             foreach (var stateName in stateTypeParameters)
             {
-                sb.Append("    where ").Append(stateName).AppendLine(" : IValueState");
+                sb.Append("    where ").Append(stateName).Append(" : ").Append(QualifiedIValueState).AppendLine();
             }
 
             sb.AppendLine("    {");
@@ -1522,14 +1643,9 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
 
                 sb.AppendLine(")");
 
-                foreach (var builderTypeConstraint in model.TypeParameterConstraints)
-                {
-                    sb.Append("    ").AppendLine(builderTypeConstraint);
-                }
-
                 foreach (var stateName in stateTypeParameters)
                 {
-                    sb.Append("    where ").Append(stateName).AppendLine(" : IValueState");
+                    sb.Append("    where ").Append(stateName).Append(" : ").Append(QualifiedIValueState).AppendLine();
                 }
 
                 sb.AppendLine("    {");
@@ -1565,21 +1681,11 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
     {
         foreach (var buildMethod in model.BuildMethods)
         {
-            var requiredStates = model.Steps.Select(static s => s.IsRequired).ToArray();
-            var stateArgs = new string[model.Steps.Count];
-            for (var i = 0; i < stateArgs.Length; i++)
-            {
-                stateArgs[i] = requiredStates[i] ? "ValueSet" : model.Steps.AsSpan()[i].StateName;
-            }
-
+            var buildShape = GetBuildShape(model, buildMethod);
             var genericMethodTypeParameters = buildMethod.TypeParameters.Select(static tp => tp.Name).ToArray();
-            var optionalStateTypeParameters = model.Steps
-                .Where(static s => !s.IsRequired)
-                .Select(static s => s.StateName)
-                .ToArray();
 
             var allMethodTypeParameters = new List<string>();
-            allMethodTypeParameters.AddRange(optionalStateTypeParameters);
+            allMethodTypeParameters.AddRange(buildShape.OptionalApplicableStateTypeParameters);
             allMethodTypeParameters.AddRange(genericMethodTypeParameters);
 
             sb.Append("    internal static ")
@@ -1596,7 +1702,7 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
             sb.Append('(')
                 .Append(model.WrapperName)
                 .Append('<')
-                .Append(string.Join(", ", GetBuilderTypeArgsThenStates(model, stateArgs)))
+                .Append(string.Join(", ", GetBuilderTypeArgsThenStates(model, buildShape.StateArgs)))
                 .Append("> builder");
 
             foreach (var parameter in buildMethod.Parameters)
@@ -1606,14 +1712,9 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
 
             sb.AppendLine(")");
 
-            foreach (var builderTypeConstraint in model.TypeParameterConstraints)
+            foreach (var optionalState in buildShape.OptionalApplicableStateTypeParameters)
             {
-                sb.Append("    ").AppendLine(builderTypeConstraint);
-            }
-
-            foreach (var optionalState in optionalStateTypeParameters)
-            {
-                sb.Append("    where ").Append(optionalState).AppendLine(" : IValueState");
+                sb.Append("    where ").Append(optionalState).Append(" : ").Append(QualifiedIValueState).AppendLine();
             }
 
             foreach (var methodConstraint in BuildTypeParameterConstraints(buildMethod.TypeParameters))
@@ -1622,10 +1723,36 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
             }
 
             sb.AppendLine("    {");
+
+            foreach (var optionalStep in buildShape.OptionalApplicableSteps)
+            {
+                if (optionalStep.Default is null)
+                {
+                    continue;
+                }
+
+                sb.Append("        if (typeof(")
+                    .Append(optionalStep.StateName)
+                    .Append(") == typeof(")
+                    .Append(QualifiedValueUnset)
+                    .AppendLine("))");
+                sb.AppendLine("        {");
+                sb.Append("            ")
+                    .Append(GetAccessorTypeReference(model))
+                    .Append('.')
+                    .Append(optionalStep.MethodName)
+                    .Append("Field(builder.Inner) = ")
+                    .Append(GetProviderInvocation(model, optionalStep, optionalStep.Default.Value.ProviderMethod,
+                        "builder.Inner"))
+                    .AppendLine(";");
+                sb.AppendLine("        }");
+                sb.AppendLine();
+            }
+
             sb.AppendLine("        List<Exception>? exceptions = null;");
             sb.AppendLine();
 
-            foreach (var step in model.Steps)
+            foreach (var step in buildShape.ApplicableSteps)
             {
                 for (var i = 0; i < step.Validators.Count; i++)
                 {
@@ -1661,7 +1788,6 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
                     sb.AppendLine("        catch (Exception ex)");
                     sb.AppendLine("        {");
                     sb.AppendLine("            (exceptions ??= new List<Exception>()).Add(ex);");
-                    sb.AppendLine();
                     sb.AppendLine("        }");
                     sb.AppendLine();
                 }
@@ -1697,13 +1823,9 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
 
     private static void EmitCreateExtensions(StringBuilder sb, BuilderModel model)
     {
-        sb.Append("public")
-            .Append(" static partial class ")
-            .AppendLine(model.CreateClassName);
+        sb.Append("public static partial class ").AppendLine(model.CreateClassName);
         sb.AppendLine("{");
-
         EmitCreateMethods(sb, model);
-
         sb.AppendLine("}");
     }
 
@@ -1711,6 +1833,7 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
     {
         foreach (var ctor in model.Constructors)
         {
+            EmitCreateMethodDocumentation(sb, model, ctor);
             sb.Append("    ")
                 .Append(model.GeneratedAccessibility == GeneratedAccessibility.Public ? "public" : "internal")
                 .Append(" static ")
@@ -1744,19 +1867,6 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
                 .Append(string.Join(", ", ctor.Parameters.Select(ParameterInvocation)))
                 .AppendLine(");");
 
-            foreach (var step in model.Steps.Where(static s => s.Default is not null))
-            {
-                var defaultModel = step.Default!.Value;
-
-                sb.Append("        ")
-                    .Append(GetFullyQualifiedAccessorTypeReference(model))
-                    .Append('.')
-                    .Append(step.MethodName)
-                    .Append("Field(inner) = ")
-                    .Append(GetProviderInvocation(model, step, defaultModel.ProviderMethod, "inner"))
-                    .AppendLine(";");
-            }
-
             sb.Append("        return new ")
                 .Append(model.FullyQualifiedWrapperName)
                 .Append('<')
@@ -1773,7 +1883,8 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
         ProviderMethodModel providerMethod,
         string builderExpression)
     {
-        return $"{GetFullyQualifiedAccessorTypeReference(model)}.{GetProviderAccessorName(step, providerMethod)}({builderExpression})";
+        return
+            $"{GetFullyQualifiedAccessorTypeReference(model)}.{GetProviderAccessorName(step, providerMethod)}({builderExpression})";
     }
 
     private static string GetValidatorInvocation(
@@ -1784,7 +1895,8 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
         string builderExpression,
         string valueExpression)
     {
-        return $"{GetAccessorTypeReference(model)}.{GetValidatorAccessorName(step, validator, validatorIndex)}({builderExpression}, {valueExpression})";
+        return
+            $"{GetAccessorTypeReference(model)}.{GetValidatorAccessorName(step, validator, validatorIndex)}({builderExpression}, {valueExpression})";
     }
 
     private static string GetAccessorTypeReference(BuilderModel model)
@@ -1815,13 +1927,11 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
         for (var i = 0; i < model.Steps.Count; i++)
         {
             var step = model.Steps.AsSpan()[i];
-            var inputStateArgs = GetStateArgumentList(model, i, "ValueUnset");
-            var outputStateArgs = GetStateArgumentList(model, i, "ValueSet");
-            var stateTypeParameters = model.Steps
-                .Where((_, index) => index != i)
-                .Select(static s => s.StateName)
-                .ToArray();
+            var inputStateArgs = GetStepMethodInputStateArgs(model, i);
+            var outputStateArgs = GetStepMethodOutputStateArgs(model, i);
+            var stateTypeParameters = GetStepMethodTypeParameters(model, i);
 
+            EmitDirectStepDocumentation(sb, step);
             sb.Append("    ")
                 .Append(model.GeneratedAccessibility == GeneratedAccessibility.Public ? "public" : "internal")
                 .Append(" static ")
@@ -1834,6 +1944,7 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
             var extensionMethodTypeParameters = new List<string>();
             extensionMethodTypeParameters.AddRange(model.TypeParameters.Select(static tp => tp.Name));
             extensionMethodTypeParameters.AddRange(stateTypeParameters);
+
             if (extensionMethodTypeParameters.Count > 0)
             {
                 sb.Append('<').Append(string.Join(", ", extensionMethodTypeParameters)).Append('>');
@@ -1856,7 +1967,7 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
 
             foreach (var stateName in stateTypeParameters)
             {
-                sb.Append("    where ").Append(stateName).AppendLine(" : IValueState");
+                sb.Append("    where ").Append(stateName).Append(" : ").Append(QualifiedIValueState).AppendLine();
             }
 
             sb.Append("        => ")
@@ -1880,6 +1991,7 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
             {
                 var overload = step.Overloads.AsSpan()[overloadIndex];
 
+                EmitOverloadStepDocumentation(sb, step, overload);
                 sb.Append("    ")
                     .Append(model.GeneratedAccessibility == GeneratedAccessibility.Public ? "public" : "internal")
                     .Append(" static ")
@@ -1915,7 +2027,7 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
 
                 foreach (var stateName in stateTypeParameters)
                 {
-                    sb.Append("    where ").Append(stateName).AppendLine(" : IValueState");
+                    sb.Append("    where ").Append(stateName).Append(" : ").Append(QualifiedIValueState).AppendLine();
                 }
 
                 sb.Append("        => ")
@@ -1947,24 +2059,15 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
     {
         foreach (var buildMethod in model.BuildMethods)
         {
-            var requiredStates = model.Steps.Select(static s => s.IsRequired).ToArray();
-            var stateArgs = new string[model.Steps.Count];
-            for (var i = 0; i < stateArgs.Length; i++)
-            {
-                stateArgs[i] = requiredStates[i] ? "ValueSet" : model.Steps.AsSpan()[i].StateName;
-            }
-
+            var buildShape = GetBuildShape(model, buildMethod);
             var genericMethodTypeParameters = buildMethod.TypeParameters.Select(static tp => tp.Name).ToArray();
-            var optionalStateTypeParameters = model.Steps
-                .Where(static s => !s.IsRequired)
-                .Select(static s => s.StateName)
-                .ToArray();
 
             var allMethodTypeParameters = new List<string>();
             allMethodTypeParameters.AddRange(model.TypeParameters.Select(static tp => tp.Name));
-            allMethodTypeParameters.AddRange(optionalStateTypeParameters);
+            allMethodTypeParameters.AddRange(buildShape.OptionalApplicableStateTypeParameters);
             allMethodTypeParameters.AddRange(genericMethodTypeParameters);
 
+            EmitBuildDocumentation(sb, buildMethod, buildShape);
             sb.Append("    ")
                 .Append(model.GeneratedAccessibility == GeneratedAccessibility.Public ? "public" : "internal")
                 .Append(" static ")
@@ -1981,7 +2084,7 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
                 .Append("this ")
                 .Append(model.WrapperName)
                 .Append('<')
-                .Append(string.Join(", ", GetBuilderTypeArgsThenStates(model, stateArgs)))
+                .Append(string.Join(", ", GetBuilderTypeArgsThenStates(model, buildShape.StateArgs)))
                 .Append("> builder");
 
             foreach (var parameter in buildMethod.Parameters)
@@ -1996,9 +2099,9 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
                 sb.Append("    ").AppendLine(builderTypeConstraint);
             }
 
-            foreach (var optionalState in optionalStateTypeParameters)
+            foreach (var optionalState in buildShape.OptionalApplicableStateTypeParameters)
             {
-                sb.Append("    where ").Append(optionalState).AppendLine(" : IValueState");
+                sb.Append("    where ").Append(optionalState).Append(" : ").Append(QualifiedIValueState).AppendLine();
             }
 
             foreach (var methodConstraint in BuildTypeParameterConstraints(buildMethod.TypeParameters))
@@ -2009,15 +2112,16 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
             sb.Append("        => ")
                 .Append(model.WrapperName)
                 .Append('<')
-                .Append(string.Join(", ", GetBuilderTypeArgsThenStates(model, stateArgs)))
+                .Append(string.Join(", ", GetBuilderTypeArgsThenStates(model, buildShape.StateArgs)))
                 .Append(">")
                 .Append('.')
                 .Append(buildMethod.Name)
                 .Append("Core");
 
             var coreInvocationTypeParameters = new List<string>();
-            coreInvocationTypeParameters.AddRange(optionalStateTypeParameters);
+            coreInvocationTypeParameters.AddRange(buildShape.OptionalApplicableStateTypeParameters);
             coreInvocationTypeParameters.AddRange(genericMethodTypeParameters);
+
             if (coreInvocationTypeParameters.Count > 0)
             {
                 sb.Append('<').Append(string.Join(", ", coreInvocationTypeParameters)).Append('>');
@@ -2033,6 +2137,216 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
             sb.AppendLine();
         }
     }
+
+    private static void EmitCreateMethodDocumentation(StringBuilder sb, BuilderModel model, ConstructorModel ctor)
+    {
+        AppendXmlSummary(sb, $"Creates a new <see cref=\"{FormatCref(model.FullyQualifiedWrapperName)}\"/>.");
+
+        foreach (var parameter in ctor.Parameters)
+        {
+            AppendXmlParam(sb, parameter.Name, $"The value for {FormatParameterDisplay(parameter.Name)}.");
+        }
+
+        AppendXmlReturns(sb, "A new builder instance.");
+    }
+
+    private static void EmitDirectStepDocumentation(StringBuilder sb, StepModel step)
+    {
+        var summary = step.BranchPath is null
+            ? $"Sets the {GetFriendlyStepDisplayName(step)}."
+            : $"Sets the {GetFriendlyStepDisplayName(step)} for the <c>{EscapeXml(step.BranchPath)}</c> branch.";
+
+        AppendXmlSummary(sb, summary);
+        AppendXmlParam(sb, "builder", "The builder.");
+        AppendXmlParam(sb, "value", $"The value for <c>{EscapeXml(step.FieldName)}</c>.");
+        AppendXmlReturns(sb, "The updated builder.");
+
+        if (step.Default is not null)
+        {
+            var remarks = step.BranchPath is null
+                ? $"If this step is not set explicitly, <c>{EscapeXml(step.Default.Value.ProviderMethod.Name)}</c> is used to provide <c>{EscapeXml(step.FieldName)}</c> during build."
+                : $"If this step is not set explicitly for the <c>{EscapeXml(step.BranchPath)}</c> branch, <c>{EscapeXml(step.Default.Value.ProviderMethod.Name)}</c> is used to provide <c>{EscapeXml(step.FieldName)}</c> during build.";
+
+            AppendXmlRemarks(sb, remarks);
+        }
+    }
+
+    private static void EmitOverloadStepDocumentation(StringBuilder sb, StepModel step, StepOverloadModel overload)
+    {
+        AppendXmlSummary(sb, $"Sets the {GetFriendlyStepDisplayName(step)}.");
+        AppendXmlParam(sb, "builder", "The builder.");
+
+        foreach (var parameter in overload.Parameters)
+        {
+            var description = overload.Parameters.Count == 1
+                ? $"The value used to produce <c>{EscapeXml(step.FieldName)}</c>."
+                : $"The value used when producing <c>{EscapeXml(step.FieldName)}</c>.";
+            AppendXmlParam(sb, parameter.Name, description);
+        }
+
+        AppendXmlReturns(sb, "The updated builder.");
+
+        if (step.Default is not null)
+        {
+            var remarks = step.BranchPath is null
+                ? $"If this step is not set explicitly, <c>{EscapeXml(step.Default.Value.ProviderMethod.Name)}</c> is used to provide <c>{EscapeXml(step.FieldName)}</c> during build."
+                : $"If this step is not set explicitly for the <c>{EscapeXml(step.BranchPath)}</c> branch, <c>{EscapeXml(step.Default.Value.ProviderMethod.Name)}</c> is used to provide <c>{EscapeXml(step.FieldName)}</c> during build.";
+
+            AppendXmlRemarks(sb, remarks);
+        }
+    }
+
+    private static void EmitBuildDocumentation(StringBuilder sb, BuildMethodModel buildMethod, BuildShape buildShape)
+    {
+        var summary = buildMethod.TargetBranchPath is null
+            ? "Builds the result."
+            : $"Builds the result for the <c>{EscapeXml(buildMethod.TargetBranchPath)}</c> branch.";
+
+        AppendXmlSummary(sb, summary);
+        AppendXmlParam(sb, "builder", "The builder.");
+
+        foreach (var parameter in buildMethod.Parameters)
+        {
+            AppendXmlParam(sb, parameter.Name, $"The value for {FormatParameterDisplay(parameter.Name)}.");
+        }
+
+        AppendXmlReturns(sb, "The built result.");
+        AppendXmlException(sb, "System.AggregateException", "Thrown if validation fails.");
+
+        var defaults = buildShape.OptionalApplicableSteps
+            .Where(static step => step.Default is not null)
+            .Select(static step => $"<c>{EscapeXml(step.FieldName)}</c> using <c>{EscapeXml(step.Default!.Value.ProviderMethod.Name)}</c>")
+            .ToArray();
+
+        if (defaults.Length > 0)
+        {
+            AppendXmlRemarks(sb,
+                $"If not set explicitly, this method provides default values for {JoinHumanReadable(defaults)}");
+        }
+    }
+
+    private static void AppendXmlSummary(StringBuilder sb, string text)
+    {
+        sb.AppendLine("    /// <summary>");
+        AppendXmlTextLines(sb, text);
+        sb.AppendLine("    /// </summary>");
+    }
+
+    private static void AppendXmlParam(StringBuilder sb, string name, string text)
+    {
+        sb.Append("    /// <param name=\"").Append(name).Append("\">");
+        sb.Append(text);
+        sb.AppendLine("</param>");
+    }
+
+    private static void AppendXmlReturns(StringBuilder sb, string text)
+    {
+        sb.AppendLine("    /// <returns>");
+        AppendXmlTextLines(sb, text);
+        sb.AppendLine("    /// </returns>");
+    }
+
+    private static void AppendXmlException(StringBuilder sb, string cref, string text)
+    {
+        sb.Append("    /// <exception cref=\"").Append(cref).Append("\">");
+        sb.Append(text);
+        sb.AppendLine("</exception>");
+    }
+
+    private static void AppendXmlRemarks(StringBuilder sb, string text)
+    {
+        sb.AppendLine("    /// <remarks>");
+        AppendXmlTextLines(sb, text);
+        sb.AppendLine("    /// </remarks>");
+    }
+
+    private static void AppendXmlTextLines(StringBuilder sb, string text)
+    {
+        foreach (var line in WrapXmlText(text))
+        {
+            sb.Append("    /// ").AppendLine(line);
+        }
+    }
+
+    private static IEnumerable<string> WrapXmlText(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            yield return string.Empty;
+            yield break;
+        }
+
+        foreach (var rawLine in text.Replace("\r\n", "\n").Split('\n'))
+        {
+            yield return rawLine;
+        }
+    }
+
+    private static string FormatCref(string fullyQualifiedTypeName)
+        => EscapeXml(fullyQualifiedTypeName.Replace("global::", string.Empty));
+
+    private static string GetFriendlyStepDisplayName(StepModel step)
+        => ToSentenceCase(step.MethodName.StartsWith("Set", StringComparison.Ordinal)
+            ? step.MethodName.Substring(3)
+            : step.MethodName);
+
+    private static string ToSentenceCase(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return value;
+        }
+
+        if (value.Length == 1)
+        {
+            return value.ToLowerInvariant();
+        }
+
+        return char.ToLowerInvariant(value[0]) + value.Substring(1);
+    }
+
+    private static string FormatParameterDisplay(string parameterName)
+        => "<c>" + EscapeXml(parameterName) + "</c>";
+
+    private static string JoinHumanReadable(IReadOnlyList<string> items)
+    {
+        if (items.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        if (items.Count == 1)
+        {
+            return items[0] + ".";
+        }
+
+        if (items.Count == 2)
+        {
+            return items[0] + " and " + items[1] + ".";
+        }
+
+        var sb = new StringBuilder();
+        for (var i = 0; i < items.Count; i++)
+        {
+            if (i > 0)
+            {
+                sb.Append(i == items.Count - 1 ? ", and " : ", ");
+            }
+
+            sb.Append(items[i]);
+        }
+
+        sb.Append('.');
+        return sb.ToString();
+    }
+
+    private static string EscapeXml(string text)
+        => text
+            .Replace("&", "&amp;")
+            .Replace("<", "&lt;")
+            .Replace(">", "&gt;")
+            .Replace("\"", "&quot;")
+            .Replace("'", "&apos;");
 
     private static string GetOptionalParameterDefault(IParameterSymbol parameter)
     {
@@ -2130,7 +2444,8 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
 
         if (type.TypeKind == TypeKind.Enum)
         {
-            return $"({type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)}){Convert.ToString(value, CultureInfo.InvariantCulture)}";
+            return
+                $"({type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat)}){Convert.ToString(value, CultureInfo.InvariantCulture)}";
         }
 
         return Convert.ToString(value, CultureInfo.InvariantCulture) ?? "null";
@@ -2162,7 +2477,7 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
     }
 
     private static string[] GetCreateReturnGenericArguments(BuilderModel model)
-        => GetBuilderTypeArgsThenStates(model, Enumerable.Repeat("ValueUnset", model.Steps.Count).ToArray());
+        => GetBuilderTypeArgsThenStates(model, Enumerable.Repeat(QualifiedValueUnset, model.Steps.Count).ToArray());
 
     private static string[] GetBuilderTypeArgsThenStates(BuilderModel model, IReadOnlyList<string> stateArgs)
     {
@@ -2195,12 +2510,12 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
         var states = stateOverride ?? model.Steps.Select(static s => s.StateName).ToArray();
         foreach (var state in states.Distinct(StringComparer.Ordinal))
         {
-            if (state is "ValueSet" or "ValueUnset")
+            if (state == QualifiedValueSet || state == QualifiedValueUnset)
             {
                 continue;
             }
 
-            yield return $"where {state} : IValueState";
+            yield return $"where {state} : {QualifiedIValueState}";
         }
     }
 
@@ -2326,13 +2641,17 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
         => "Provide_" + SanitizeIdentifier(step.MethodName + "_" + providerMethod.Name);
 
     private static string GetValidatorAccessorName(StepModel step, ValidatorModel validator, int index)
-        => "Validate_" + SanitizeIdentifier(step.MethodName + "_" + validator.Name + "_" + index.ToString(CultureInfo.InvariantCulture));
+        => "Validate_" + SanitizeIdentifier(step.MethodName + "_" + validator.Name + "_" +
+                                            index.ToString(CultureInfo.InvariantCulture));
 
     private static string GetStepOverloadAccessorName(StepModel step, StepOverloadModel overload, int index)
-        => "Overload_" + SanitizeIdentifier(step.MethodName + "_" + overload.Name + "_" + index.ToString(CultureInfo.InvariantCulture));
+        => "Overload_" + SanitizeIdentifier(step.MethodName + "_" + overload.Name + "_" +
+                                            index.ToString(CultureInfo.InvariantCulture));
 
     private static string GetStepOverloadCoreName(StepModel step, StepOverloadModel overload, int index)
-        => "SetFrom_" + SanitizeIdentifier(step.MethodName + "_" + overload.Name + "_" + index.ToString(CultureInfo.InvariantCulture)) + "Core";
+        => "SetFrom_" +
+           SanitizeIdentifier(
+               step.MethodName + "_" + overload.Name + "_" + index.ToString(CultureInfo.InvariantCulture)) + "Core";
 
     private static string GetStepMethodName(string fieldName)
     {
@@ -2436,51 +2755,327 @@ public sealed class TypedStateBuilderIncrementalGenerator : IIncrementalGenerato
         return sb.ToString();
     }
 
+    private static bool TryNormalizeBranchPath(string rawPath, out string? normalizedPath, out string error)
+    {
+        normalizedPath = null;
+        error = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(rawPath))
+        {
+            error = "branch path cannot be empty";
+            return false;
+        }
+
+        var parts = rawPath.Split('/');
+        var normalizedParts = new List<string>(parts.Length);
+
+        foreach (var part in parts)
+        {
+            var trimmed = part.Trim();
+            if (trimmed.Length == 0)
+            {
+                error = "branch path must not contain empty segments";
+                return false;
+            }
+
+            normalizedParts.Add(trimmed);
+        }
+
+        normalizedPath = string.Join("/", normalizedParts);
+        return true;
+    }
+
+    private static bool IsBranchPrefixOrEqual(string prefix, string target)
+        => prefix == target || target.StartsWith(prefix + "/", StringComparison.Ordinal);
+
+    private static bool IsStepApplicableToBuild(string? stepBranchPath, string? targetBranchPath)
+    {
+        if (stepBranchPath is null)
+        {
+            return true;
+        }
+
+        if (targetBranchPath is null)
+        {
+            return false;
+        }
+
+        return IsBranchPrefixOrEqual(stepBranchPath, targetBranchPath);
+    }
+
+    private static bool AreBranchPathsCompatible(string? left, string? right)
+    {
+        if (left is null || right is null)
+        {
+            return true;
+        }
+
+        return IsBranchPrefixOrEqual(left, right) || IsBranchPrefixOrEqual(right, left);
+    }
+
+    private static string GetStepMethodOtherStateConstraint(BuilderModel model, int currentStepIndex,
+        string otherStateName)
+    {
+        var currentStep = model.Steps.AsSpan()[currentStepIndex];
+        var otherStep = model.Steps.First(s => s.StateName == otherStateName);
+
+        return AreBranchPathsCompatible(currentStep.BranchPath, otherStep.BranchPath)
+            ? QualifiedIValueState
+            : QualifiedValueUnset;
+    }
+
+    private static BuildShape GetBuildShape(BuilderModel model, BuildMethodModel buildMethod)
+    {
+        var stateArgs = new string[model.Steps.Count];
+        var applicableSteps = new List<StepModel>();
+        var optionalApplicableSteps = new List<StepModel>();
+        var optionalApplicableStateTypeParameters = new List<string>();
+
+        for (var i = 0; i < model.Steps.Count; i++)
+        {
+            var step = model.Steps.AsSpan()[i];
+            var applicable = IsStepApplicableToBuild(step.BranchPath, buildMethod.TargetBranchPath);
+
+            if (!applicable)
+            {
+                stateArgs[i] = QualifiedValueUnset;
+                continue;
+            }
+
+            applicableSteps.Add(step);
+
+            if (step.IsRequired)
+            {
+                stateArgs[i] = QualifiedValueSet;
+            }
+            else
+            {
+                stateArgs[i] = step.StateName;
+                optionalApplicableSteps.Add(step);
+                optionalApplicableStateTypeParameters.Add(step.StateName);
+            }
+        }
+
+        return new BuildShape(
+            StateArgs: stateArgs,
+            ApplicableSteps: applicableSteps.ToEquatableArray(),
+            OptionalApplicableSteps: optionalApplicableSteps.ToEquatableArray(),
+            OptionalApplicableStateTypeParameters: optionalApplicableStateTypeParameters.ToEquatableArray());
+    }
+
+    private static string[] GetStepMethodInputStateArgs(BuilderModel model, int currentStepIndex)
+    {
+        var args = new string[model.Steps.Count];
+        var current = model.Steps.AsSpan()[currentStepIndex];
+
+        for (var i = 0; i < model.Steps.Count; i++)
+        {
+            var other = model.Steps.AsSpan()[i];
+
+            if (i == currentStepIndex)
+            {
+                args[i] = QualifiedValueUnset;
+            }
+            else if (!AreBranchPathsCompatible(current.BranchPath, other.BranchPath))
+            {
+                args[i] = QualifiedValueUnset;
+            }
+            else if (IsStrictBranchAncestor(other.BranchPath, current.BranchPath))
+            {
+                args[i] = QualifiedValueSet;
+            }
+            else
+            {
+                args[i] = other.StateName;
+            }
+        }
+
+        return args;
+    }
+
+    private static string[] GetStepMethodOutputStateArgs(BuilderModel model, int currentStepIndex)
+    {
+        var args = new string[model.Steps.Count];
+        var current = model.Steps.AsSpan()[currentStepIndex];
+
+        for (var i = 0; i < model.Steps.Count; i++)
+        {
+            var other = model.Steps.AsSpan()[i];
+
+            if (i == currentStepIndex)
+            {
+                args[i] = QualifiedValueSet;
+            }
+            else if (!AreBranchPathsCompatible(current.BranchPath, other.BranchPath))
+            {
+                args[i] = QualifiedValueUnset;
+            }
+            else if (IsStrictBranchAncestor(other.BranchPath, current.BranchPath))
+            {
+                args[i] = QualifiedValueSet;
+            }
+            else
+            {
+                args[i] = other.StateName;
+            }
+        }
+
+        return args;
+    }
+
+    private static string[] GetStepMethodTypeParameters(BuilderModel model, int currentStepIndex)
+    {
+        var list = new List<string>();
+        var current = model.Steps.AsSpan()[currentStepIndex];
+
+        for (var i = 0; i < model.Steps.Count; i++)
+        {
+            if (i == currentStepIndex)
+            {
+                continue;
+            }
+
+            var other = model.Steps.AsSpan()[i];
+
+            if (!AreBranchPathsCompatible(current.BranchPath, other.BranchPath))
+            {
+                continue;
+            }
+
+            if (IsStrictBranchAncestor(other.BranchPath, current.BranchPath))
+            {
+                continue;
+            }
+
+            list.Add(other.StateName);
+        }
+
+        return list.ToArray();
+    }
+
+    private static bool IsStrictBranchAncestor(string? ancestor, string? descendant)
+    {
+        if (ancestor is null || descendant is null)
+        {
+            return false;
+        }
+
+        return descendant.StartsWith(ancestor + "/", StringComparison.Ordinal);
+    }
+
     private static readonly string AttributeSources = @"// <auto-generated />
 #nullable enable
 using System;
 
 namespace TypedStateBuilder;
 
+/// <summary>
+/// Represents a builder step state.
+/// </summary>
 public interface IValueState { }
 
+/// <summary>
+/// Indicates that a builder step has been set.
+/// </summary>
 public sealed class ValueSet : IValueState { }
 
+/// <summary>
+/// Indicates that a builder step has not been set.
+/// </summary>
 public sealed class ValueUnset : IValueState { }
 
+/// <summary>
+/// Marks a method as a build method.
+/// </summary>
 [AttributeUsage(AttributeTargets.Method, AllowMultiple = false, Inherited = false)]
 public sealed class BuildAttribute : Attribute
 {
+    /// <summary>
+    /// Marks a method as a build method.
+    /// </summary>
+    public BuildAttribute()
+    {
+    }
+
+    /// <summary>
+    /// Marks a method as a build method for a specific branch.
+    /// </summary>
+    /// <param name=""targetBranch"">The branch path.</param>
+    public BuildAttribute(string targetBranch)
+    {
+    }
 }
 
+/// <summary>
+/// Marks a field as a builder step.
+/// </summary>
 [AttributeUsage(AttributeTargets.Field, AllowMultiple = false, Inherited = false)]
 public class StepForValueAttribute : Attribute
 {
+    /// <summary>
+    /// Marks a required builder step.
+    /// </summary>
     public StepForValueAttribute()
     {
     }
 
+    /// <summary>
+    /// Marks an optional builder step with a default value provider.
+    /// </summary>
+    /// <param name=""providerMemberName"">The provider member name.</param>
     public StepForValueAttribute(string providerMemberName)
     {
     }
 }
 
+/// <summary>
+/// Assigns a step to a branch.
+/// </summary>
+[AttributeUsage(AttributeTargets.Field, AllowMultiple = false, Inherited = false)]
+public sealed class StepBranchAttribute : Attribute
+{
+    /// <summary>
+    /// Assigns a step to a branch.
+    /// </summary>
+    /// <param name=""branchPath"">The branch path.</param>
+    public StepBranchAttribute(string branchPath)
+    {
+    }
+}
+
+/// <summary>
+/// Adds another way to set a builder step.
+/// </summary>
 [AttributeUsage(AttributeTargets.Field, AllowMultiple = true, Inherited = false)]
 public sealed class StepOverloadAttribute : Attribute
 {
+    /// <summary>
+    /// Adds another way to set a builder step.
+    /// </summary>
+    /// <param name=""overloadMemberName"">The overload member name.</param>
     public StepOverloadAttribute(string overloadMemberName)
     {
     }
 }
 
+/// <summary>
+/// Adds validation for a builder step.
+/// </summary>
 [AttributeUsage(AttributeTargets.Field, AllowMultiple = true, Inherited = false)]
 public sealed class ValidateValueAttribute : Attribute
 {
+    /// <summary>
+    /// Adds validation for a builder step.
+    /// </summary>
+    /// <param name=""validatorMemberName"">The validator member name.</param>
     public ValidateValueAttribute(string validatorMemberName)
     {
     }
 }
 
+/// <summary>
+/// Enables typed builder generation for a builder class.
+/// </summary>
 [AttributeUsage(AttributeTargets.Class, AllowMultiple = false, Inherited = false)]
 public sealed class TypedStateBuilderAttribute : Attribute
 {
@@ -2491,12 +3086,14 @@ public sealed class TypedStateBuilderAttribute : Attribute
         INamedTypeSymbol? BuildAttribute,
         INamedTypeSymbol? StepForValueAttribute,
         INamedTypeSymbol? StepOverloadAttribute,
+        INamedTypeSymbol? StepBranchAttribute,
         INamedTypeSymbol? ValidateValueAttribute,
         INamedTypeSymbol? TaskType)
     {
         public INamedTypeSymbol? BuildAttribute { get; } = BuildAttribute;
         public INamedTypeSymbol? StepForValueAttribute { get; } = StepForValueAttribute;
         public INamedTypeSymbol? StepOverloadAttribute { get; } = StepOverloadAttribute;
+        public INamedTypeSymbol? StepBranchAttribute { get; } = StepBranchAttribute;
         public INamedTypeSymbol? ValidateValueAttribute { get; } = ValidateValueAttribute;
         public INamedTypeSymbol? TaskType { get; } = TaskType;
     }
@@ -2562,6 +3159,7 @@ public sealed class TypedStateBuilderAttribute : Attribute
         string ReturnTypeName,
         bool IsStatic,
         bool IsGenericMethod,
+        string? TargetBranchPath,
         EquatableArray<TypeParameterModel> TypeParameters,
         EquatableArray<ParameterModel> Parameters)
     {
@@ -2569,6 +3167,7 @@ public sealed class TypedStateBuilderAttribute : Attribute
         public string ReturnTypeName { get; } = ReturnTypeName;
         public bool IsStatic { get; } = IsStatic;
         public bool IsGenericMethod { get; } = IsGenericMethod;
+        public string? TargetBranchPath { get; } = TargetBranchPath;
         public EquatableArray<TypeParameterModel> TypeParameters { get; } = TypeParameters;
         public EquatableArray<ParameterModel> Parameters { get; } = Parameters;
     }
@@ -2600,6 +3199,7 @@ public sealed class TypedStateBuilderAttribute : Attribute
         string FieldTypeName,
         string StateName,
         string MethodName,
+        string? BranchPath,
         DefaultModel? Default,
         bool IsRequired,
         EquatableArray<ValidatorModel> Validators,
@@ -2609,6 +3209,7 @@ public sealed class TypedStateBuilderAttribute : Attribute
         public string FieldTypeName { get; } = FieldTypeName;
         public string StateName { get; } = StateName;
         public string MethodName { get; } = MethodName;
+        public string? BranchPath { get; } = BranchPath;
         public DefaultModel? Default { get; } = Default;
         public bool IsRequired { get; } = IsRequired;
         public EquatableArray<ValidatorModel> Validators { get; } = Validators;
@@ -2645,6 +3246,20 @@ public sealed class TypedStateBuilderAttribute : Attribute
         public EquatableArray<ParameterModel> Parameters { get; } = Parameters;
         public string SignatureKey { get; } = SignatureKey;
         public string DisplayName { get; } = DisplayName;
+    }
+
+    private readonly record struct BuildShape(
+        IReadOnlyList<string> StateArgs,
+        EquatableArray<StepModel> ApplicableSteps,
+        EquatableArray<StepModel> OptionalApplicableSteps,
+        EquatableArray<string> OptionalApplicableStateTypeParameters)
+    {
+        public IReadOnlyList<string> StateArgs { get; } = StateArgs;
+        public EquatableArray<StepModel> ApplicableSteps { get; } = ApplicableSteps;
+        public EquatableArray<StepModel> OptionalApplicableSteps { get; } = OptionalApplicableSteps;
+
+        public EquatableArray<string> OptionalApplicableStateTypeParameters { get; } =
+            OptionalApplicableStateTypeParameters;
     }
 
     private enum ParameterRefKind
@@ -2793,6 +3408,39 @@ public sealed class TypedStateBuilderAttribute : Attribute
             title: "Multiple parameterless step overloads are not supported",
             messageFormat:
             "Field '{0}' on builder '{1}' generates multiple parameterless overloads for step method '{2}': {3}. Only one parameterless [StepOverload] is allowed per step.",
+            category: "TypedStateBuilder",
+            defaultSeverity: DiagnosticSeverity.Error,
+            isEnabledByDefault: true);
+
+        public static readonly DiagnosticDescriptor InvalidStepBranchPath = new(
+            id: "TSB017",
+            title: "Invalid step branch path",
+            messageFormat: "Field '{0}' on builder '{1}' has an invalid [StepBranch] path: {2}.",
+            category: "TypedStateBuilder",
+            defaultSeverity: DiagnosticSeverity.Error,
+            isEnabledByDefault: true);
+
+        public static readonly DiagnosticDescriptor InvalidBuildBranchTarget = new(
+            id: "TSB018",
+            title: "Invalid build branch target",
+            messageFormat: "Build method '{0}' on builder '{1}' has an invalid target branch: {2}.",
+            category: "TypedStateBuilder",
+            defaultSeverity: DiagnosticSeverity.Error,
+            isEnabledByDefault: true);
+
+        public static readonly DiagnosticDescriptor BranchedBuilderRequiresBuildTarget = new(
+            id: "TSB019",
+            title: "Branched builder requires explicit build target",
+            messageFormat:
+            "Build method '{0}' on branched builder '{1}' must specify an explicit [Build(\"branch/path\")] target.",
+            category: "TypedStateBuilder",
+            defaultSeverity: DiagnosticSeverity.Error,
+            isEnabledByDefault: true);
+
+        public static readonly DiagnosticDescriptor StepBranchRequiresStepForValue = new(
+            id: "TSB020",
+            title: "StepBranch requires StepForValue",
+            messageFormat: "Field '{0}' on builder '{1}' uses [StepBranch] but is not marked with [StepForValue].",
             category: "TypedStateBuilder",
             defaultSeverity: DiagnosticSeverity.Error,
             isEnabledByDefault: true);

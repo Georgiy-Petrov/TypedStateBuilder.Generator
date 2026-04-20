@@ -1,91 +1,79 @@
 # TypedStateBuilder
 
-A Roslyn incremental source generator that produces **compile-time safe builders** using the *type-state pattern*.
+A Roslyn incremental source generator that makes **invalid builder usage impossible to compile**.
 
-It takes a **builder template** and generates the boilerplate needed for a strongly-typed, guided construction API where correctness is enforced by the compiler - not by runtime checks or conventions.
+You define a normal builder class. The generator produces a fluent API where **invalid construction flows are not expressible through the generated API**.
 
 [![NuGet](https://img.shields.io/nuget/v/TypedStateBuilder.Generator.svg?logo=nuget)](https://www.nuget.org/packages/TypedStateBuilder.Generator)
 
 ---
 
-## Table of Contents
+## Why
 
-* [Why this exists](#why-this-exists)
-* [What this solves](#what-this-solves)
-* [Comparison](#comparison)
-* [Example](#example)
-* [What gets generated](#what-gets-generated)
-* [How it works](#how-it-works)
-* [Attributes API](#attributes-api)
-* [Defining steps](#defining-steps)
-* [Step overloads](#step-overloads)
-* [Optional values and defaults](#optional-values-and-defaults)
-* [Validation](#validation)
-* [Build methods](#build-methods)
-* [Constructors](#constructors)
-* [Dependency Injection](#dependency-injection)
-* [Performance characteristics](#performance-characteristics)
-* [Constraints and limitations](#constraints-and-limitations)
-* [Diagnostics overview](#diagnostics-overview)
-* [Why use it](#why-use-it)
-* [Summary](#summary)
-
----
-
-## Why this exists
-
-Traditional builders in C# rely on:
+Traditional builders rely on:
 
 * runtime validation
-* defensive programming
+* defensive checks
 * developer discipline
 
-This often leads to:
+This allows invalid usage such as:
 
 * missing required values
-* duplicated or conflicting assignments
-* scattered validation logic
-* bugs discovered only at runtime
+* conflicting assignments
+* calling `Build()` too early
+
+These issues are only detected at runtime.
+
+TypedStateBuilder moves **structural correctness into the type system**, so incorrect usage cannot be expressed in the first place.
+
+Unlike interface-based step builders, this approach:
+
+* requires **no manual interfaces**
+* avoids **state explosion**
+* keeps your builder **simple and idiomatic**
+
+You write the builder once. The generator handles the rest.
 
 ---
 
 ## What this solves
 
-TypedStateBuilder shifts structural correctness to **compile time**, while keeping flexibility:
+TypedStateBuilder enforces correct builder usage while keeping the flexibility of a fluent API:
 
-* `Build()` is only available when all required values are set
-* required steps can be executed **in any order**
-* each step can only be called **once (in the typed API)**
+* `Build()` is only available when required values are set
+* required steps can be executed in any order (unless constrained by branching)
+* each step can be applied only once (in the typed API)
 * optional values can be defaulted automatically
-* validation is centralized and always executed
+* validation is centralized and automatically executed for applicable steps
 * one logical step can expose multiple input shapes via overloads
+* multiple branch-specific build paths can coexist safely
 
-Result: **invalid builder usage becomes unrepresentable code**, without sacrificing fluent API flexibility.
+Result: **invalid builder usage becomes unrepresentable code**, instead of something you have to guard against at runtime.
 
-> Note: value correctness is still enforced at runtime via validation.
+> Structural correctness is enforced at compile time.
+> Value correctness is still enforced at runtime via validation.
 
 ---
 
 ## Comparison
 
-| Feature                  | Simple Builder | Interface Step Builder | TypedStateBuilder |
-|--------------------------|----------------|------------------------|-------------------|
-| Compile-time safety      | ❌              | ✅                      | ✅                 |
-| Ensures required steps   | ❌              | ✅                      | ✅                 |
-| Prevents duplicate steps | ❌              | ✅                      | ✅                 |
-| Flexible ordering        | ✅              | ❌                      | ✅                 |
-| Boilerplate required     | Low            | High                   | Low               |
-| Runtime overhead         | Low            | Medium                 | Low               |
-| Default values           | Manual         | Manual                 | Built-in          |
-| Validation               | Manual         | Manual                 | Built-in          |
-| Step overloads           | Manual         | Manual                 | Built-in          |
-| IDE experience           | High           | Medium                 | High              |
+| Feature                 | Simple Builder | Interface Step Builder | TypedStateBuilder |
+| ----------------------- | -------------- | ---------------------- | ----------------- |
+| Compile-time safety     | ❌              | ✅                      | ✅                 |
+| Required steps enforced | ❌              | ✅                      | ✅                 |
+| Prevent duplicate steps | ❌              | ✅                      | ✅                 |
+| Flexible ordering       | ✅              | ❌                      | ✅                 |
+| Boilerplate             | Low            | High                   | Low               |
+| Default values          | Manual         | Manual                 | Built-in          |
+| Validation              | Manual         | Manual                 | Built-in          |
+| Step overloads          | Manual         | Manual                 | Built-in          |
+| Branch-specific builds  | Manual         | Manual                 | Built-in          |
 
 ---
 
 ## Example
 
-Define a builder template:
+### Builder template
 
 ```csharp
 [TypedStateBuilder]
@@ -124,26 +112,22 @@ public class UserBuilder
     public User Build()
         => new User(_name, _email, _age);
 }
-````
-
-Usage:
-
-```csharp
-var user = TypedStateBuilders
-    .CreateUserBuilder(emailService)
-    .SetName("Alice", "Walker")       // overload-generated step
-    .SetEmail("alice@example.com")
-    .Build();                         // age defaults to 18
 ```
 
-The direct step method still exists too:
+### Usage
 
 ```csharp
 var user = TypedStateBuilders
     .CreateUserBuilder(emailService)
-    .SetName("Alice Walker")
+    .SetName("Alice", "Walker")
     .SetEmail("alice@example.com")
     .Build();
+```
+
+The direct step method still exists:
+
+```csharp
+.SetName("Alice Walker")
 ```
 
 Invalid usage is caught at compile time:
@@ -152,47 +136,45 @@ Invalid usage is caught at compile time:
 var invalid = TypedStateBuilders
     .CreateUserBuilder(emailService)
     .SetName("Alice")
-    .Build(); // ❌ compile-time error (email not set)
+    .Build(); // ❌ email not set
 ```
-
-### Key takeaway
-
-You get:
-
-* **compile-time guarantees** (required steps must be set)
-* **flexible ordering** (no enforced sequence)
-* **no duplicated steps** (cannot call the same logical step twice)
-* **multiple input forms for a step** via `StepOverload`
-* **support for dependency injection** (usable in validation, build logic, default providers, or overload methods)
 
 ---
 
-## What gets generated
+## What you write vs what you get
 
-For each `[TypedStateBuilder]` class, the generator produces:
+You only write:
 
-* **Typed wrapper** (`TypedMyBuilder<...>`)
-* **Fluent step extension methods**
-* **Fluent step overload extension methods**
-* **Strongly-typed build methods**
-* **Factory methods (`CreateMyBuilder`)**
-* **Internal accessor layer** (via `UnsafeAccessor`)
+* a normal class
+* fields marked with `[StepForValue]`
+* optional:
 
-You define a builder template, and the generator produces the repetitive type-state boilerplate.
+  * defaults (`[StepForValue(nameof(...))]`)
+  * validators (`[ValidateValue]`)
+  * overloads (`[StepOverload]`)
+  * branches (`[StepBranch]`)
+* one or more `[Build]` methods
+
+The generator produces:
+
+* a typed wrapper (`TypedMyBuilder<...>`)
+* fluent step methods (`SetX(...)`)
+* compile-time enforcement of required steps
+* build methods that are only available when valid
+
+No interfaces, no manual state tracking, no boilerplate.
 
 ---
 
 ## How it works
 
-Each step is encoded as a **type-state**:
+Each step is encoded as a **type-state transition**:
 
 ```text
 ValueUnset → ValueSet
 ```
 
-The wrapper carries one state per step as generic parameters.
-
-Example progression:
+The generated wrapper carries one state per step:
 
 ```csharp
 TypedBuilder<ValueUnset, ValueUnset, ValueUnset>
@@ -200,62 +182,122 @@ TypedBuilder<ValueUnset, ValueUnset, ValueUnset>
     → SetEmail → TypedBuilder<ValueSet, ValueSet, ValueUnset>
 ```
 
-`Build()` becomes available only when all required states are `ValueSet`.
+A build method becomes available only when all required states for that build path are `ValueSet`.
 
-Step overloads reuse the same state transition. For example, both of these set the same logical step:
+### Step semantics
 
-```csharp
-builder.SetName("Alice Walker");
-builder.SetName("Alice", "Walker");
-```
+Each step:
 
-Both transition the same step from `ValueUnset` to `ValueSet`.
+* can be called exactly once (in the typed API)
+* transitions its state from `ValueUnset` to `ValueSet`
+* is enforced by the type system — not runtime checks
 
----
-
-## Attributes API
-
-| Attribute           | Target | Purpose                   | Parameters                   | Rules                                                            |
-|---------------------|--------|---------------------------|------------------------------|------------------------------------------------------------------|
-| `TypedStateBuilder` | Class  | Enables generation        | None                         | Must be non-nested, non-partial, no inheritance, public/internal |
-| `StepForValue`      | Field  | Defines a step            | Optional: `nameof(provider)` | Field must be mutable instance field                             |
-| `StepOverload`      | Field  | Adds step input overloads | `nameof(method)`             | Field must already be a step                                     |
-| `Build`             | Method | Defines build entry       | None                         | Must be instance method                                          |
-| `ValidateValue`     | Field  | Adds validation           | `nameof(validator)`          | Must match validator signature                                   |
+The underlying builder remains mutable, but repeated assignments are not expressible through the generated API.
 
 ---
 
-## Defining steps
+## Branching
 
-```csharp
-[StepForValue]
-private string _name;
+### Mental model
+
+Think of branches like paths:
+
+```
+car/
+car/electric/
+bike/
 ```
 
-### Rules
+* `car` applies to `car/electric`
+* `bike` is completely separate
+* deeper paths build on their parents
 
-* must be a **field**
-* must be **instance**
-* must not be `static`
-* must not be `readonly`
+This keeps related steps together while preventing invalid combinations.
 
-Each step generates:
+---
+
+### Example
 
 ```csharp
-builder.SetName(value)
+[TypedStateBuilder]
+public class VehicleBuilder
+{
+    [StepForValue]
+    private string _name;
+
+    [StepForValue]
+    [StepBranch("car")]
+    private int _doorCount;
+
+    [StepForValue(nameof(DefaultBatteryKWh))]
+    [StepBranch("car/electric")]
+    private int _batteryKWh;
+
+    [StepForValue]
+    [StepBranch("bike")]
+    private bool _hasBell;
+
+    private int DefaultBatteryKWh() => 75;
+
+    [Build("car")]
+    public Vehicle BuildCar()
+        => Vehicle.Car(_name, _doorCount);
+
+    [Build("car/electric")]
+    public Vehicle BuildElectricCar()
+        => Vehicle.ElectricCar(_name, _doorCount, _batteryKWh);
+
+    [Build("bike")]
+    public Vehicle BuildBike()
+        => Vehicle.Bike(_name, _hasBell);
+}
 ```
 
-### Important behavior
+---
 
-* each step can be called **only once** in the typed API
-* enforced by the **type system**, not runtime checks
-* underlying fields remain mutable, but repeated calls are not expressible through generated step methods
+### Branch semantics
+
+#### Build requirement
+
+If any step uses branching, **all build methods must specify an explicit branch target**:
+
+```csharp
+[Build("car")]
+public Vehicle BuildCar()
+```
+
+Unbranched `[Build]` methods are not allowed in branched builders.
+
+---
+
+#### Step applicability
+
+A step applies if:
+
+* it is unbranched, or
+* its branch matches the build target, or
+* its branch is a parent of the build target
+
+---
+
+#### Step compatibility
+
+Two steps are compatible if:
+
+* either is unbranched, or
+* one branch is the same as or a parent of the other
+
+Sibling branches are incompatible.
+
+---
+
+#### Ancestor requirement
+
+If a step belongs to a deeper branch, any declared ancestor steps must already be set before it is callable.
 
 ---
 
 ## Step overloads
-
-`StepOverload` lets one step expose additional generated extension methods.
 
 ```csharp
 [StepForValue]
@@ -266,87 +308,12 @@ private string CreateName(string first, string last)
     => $"{first} {last}";
 ```
 
-This generates an additional overload of the step method:
+Generated API:
 
 ```csharp
-builder.SetName(string value)
-builder.SetName(string first, string last)
+builder.SetName("Alice Walker");
+builder.SetName("Alice", "Walker");
 ```
-
-### Behavior
-
-When an overload-generated step method is called:
-
-1. the referenced builder method is invoked
-2. its return value becomes the field value
-3. the original step is applied internally
-4. the step state changes from `ValueUnset` to `ValueSet`
-
-So this:
-
-```csharp
-builder.SetName("Alice", "Walker")
-```
-
-behaves like:
-
-```csharp
-var value = CreateName("Alice", "Walker");
-builder.SetName(value);
-```
-
-### Rules
-
-A `StepOverload` target method:
-
-* must use `nameof(...)`
-* must be declared on the same builder class
-* must be a method
-* must be **non-generic**
-* must return the **same type as the target field**
-* may be instance or static
-* may have any parameter list supported by the generator parameter model
-
-### Multiple overloads
-
-You can add multiple overload methods to the same step:
-
-```csharp
-[StepForValue]
-[StepOverload(nameof(CreateFromFullName))]
-[StepOverload(nameof(CreateFromParts))]
-private string _name;
-```
-
-### Important restrictions
-
-Generated step overloads must not collide by signature.
-
-Examples of invalid configurations:
-
-* two overload methods that would both generate `SetName(string value)`
-* a direct step plus an overload method that would generate the same parameter signature
-* multiple parameterless overload methods for the same step
-
-This is invalid:
-
-```csharp
-[StepForValue]
-[StepOverload(nameof(CreateDefaultA))]
-[StepOverload(nameof(CreateDefaultB))]
-private string _name;
-
-private string CreateDefaultA() => "A";
-private string CreateDefaultB() => "B";
-```
-
-because both would generate:
-
-```csharp
-builder.SetName()
-```
-
-Only **one parameterless `StepOverload`** is allowed per step.
 
 ---
 
@@ -359,26 +326,11 @@ private int _age;
 
 ### Behavior
 
-* default values are assigned during `Create...`
-* the step becomes **optional**
-* optional steps can be skipped before calling `Build()`
+* step becomes optional
+* if unset, default runs during build
+* state remains `ValueUnset` until build
 
-**Important details**
-
-* the step is still `ValueUnset` in the type-state system
-* you can still call the step explicitly afterward
-* optionality affects **build availability**, not initial state
-* default providers run eagerly during builder creation
-
-### Rules
-
-A default provider:
-
-* must use `nameof(...)`
-* must be declared on the builder
-* must be parameterless
-* must be non-generic
-* must return the exact field type
+Defaults are applied before validation and build execution.
 
 ---
 
@@ -389,19 +341,11 @@ A default provider:
 private string _name;
 ```
 
-### Rules
-
-* must use `nameof(...)`
-* must be declared on the builder
-* must accept exactly one parameter of the field type
-* must be non-generic
-* must return `void` or `Task`
-
 ### Behavior
 
 * runs automatically before build
-* runs for **all steps**
-* exceptions are **aggregated**
+* runs only for steps applicable to the selected build path
+* exceptions are aggregated:
 
 ```csharp
 throw new AggregateException(...)
@@ -409,9 +353,14 @@ throw new AggregateException(...)
 
 ### Execution details
 
-* async validators are executed synchronously
-* internally, `GetAwaiter().GetResult()` is used
-* this introduces **blocking behavior**
+* defaults are applied first
+* validators run next
+* async validators execute synchronously (`GetAwaiter().GetResult()`)
+
+Note:
+
+* async validators are supported but executed synchronously
+* there is currently no async build pipeline
 
 ---
 
@@ -419,189 +368,121 @@ throw new AggregateException(...)
 
 ```csharp
 [Build]
-public User Build() => ...
+public User Build()
 ```
 
-### Features
+or:
 
-* multiple build methods supported
-* parameters preserved
-* generic methods supported
-* return type preserved
+```csharp
+[Build("car")]
+public Vehicle BuildCar()
+```
 
-Available only when required steps are satisfied.
-
-### Rules
+### Behavior
 
 A build method:
 
-* must be marked with `[Build]`
-* must be an **instance method**
-* may be generic
-* may have parameters and optional parameter defaults
+* is only callable when required steps are satisfied
+* preserves parameters and generics
+* runs defaults and validation before execution
+
+---
+
+## What gets generated
+
+For each builder:
+
+* typed wrapper (`TypedMyBuilder<...>`)
+* step extension methods
+* step overload extension methods
+* build extension methods
+* factory methods (`CreateMyBuilder(...)`)
+* internal accessor layer (`UnsafeAccessor`)
 
 ---
 
 ## Constructors
 
-Constructors are exposed via factory methods:
+Constructors are exposed via:
 
 ```csharp
-TypedStateBuilders.CreateUserBuilder(...)
+TypedStateBuilders.CreateMyBuilder(...)
 ```
 
-### Features
-
-* multiple constructors supported
-* parameters preserved (`ref`, `out`, `in`, defaults)
-* constructor signatures are surfaced as generated `Create...` methods
+* parameters preserved
+* defaults preserved
+* initial state: all steps `ValueUnset`
 
 ---
 
 ## Dependency Injection
 
-Constructor parameters flow directly into the builder:
+Constructor dependencies can be used in:
 
-* store them in non-step fields
-* use them in:
-
-  * build logic
-  * validation
-  * default providers
-  * step overload methods
+* build logic
+* validation
+* default providers
+* step overload methods
 
 ---
 
-## Performance characteristics
+## Performance
 
 * incremental generator (fast IDE experience)
 * no reflection
+* no runtime state tracking objects
+* direct field/method access via generated accessors
 * minimal runtime overhead
-* wrapper allocation per step transition
-* direct access via `UnsafeAccessor`
+* wrapper allocation per step
+* shared underlying builder instance
 
-### Notes
+Notes:
 
-* validation may allocate when exceptions occur
-* async validation introduces blocking due to `GetAwaiter().GetResult()`
-* step overloads add no extra runtime abstraction beyond the generated forwarding call
+* async validation blocks
+* allocations mainly occur on validation failure
 
 ---
 
 ## Constraints and limitations
 
-### Builder shape
+### Builder
 
-* must be a **class**
-* must be **non-nested**
-* must be **non-partial**
-* must not use **inheritance**
-* must be **public** or **internal**
+* class only
+* non-nested
+* non-partial
+* no inheritance
+* public or internal
 
 ### Steps
 
-* fields only (no properties)
+* fields only
 * must be mutable
-* names must not collide after normalization
+* no static or readonly
+
+### Branching
+
+* path-based, prefix matching
+* explicit build targets required when used
 
 ### Step overloads
 
-* only valid on fields that are already steps
-* overload target methods must be non-generic
-* overload target methods must return the exact field type
-* generated overload signatures must not collide
-* only one parameterless overload is allowed per step
+* must be non-generic
+* must return field type
+* must not collide
 
-### Validators
+### Validation
 
 * only `void` or `Task` supported
-* executed synchronously
-
-### Behavior constraints
-
-* steps are **single-assignment** in the generated typed API
-* optional steps are **not marked as set automatically**
-* validation runs before build
-* wrappers share the same underlying mutable builder instance
-
----
-
-## Diagnostics overview
-
-The generator reports diagnostics when builder definitions violate its rules.
-
-Current diagnostic IDs:
-
-| ID       | Meaning                                                 |
-|----------|---------------------------------------------------------|
-| `TSB001` | Invalid builder shape                                   |
-| `TSB002` | Static step field not supported                         |
-| `TSB003` | Readonly step field not supported                       |
-| `TSB005` | Invalid build method                                    |
-| `TSB006` | Invalid step default provider syntax                    |
-| `TSB007` | Invalid step default provider member                    |
-| `TSB008` | Duplicate generated step method                         |
-| `TSB009` | Builder has no steps                                    |
-| `TSB010` | Builder has no build methods                            |
-| `TSB011` | Invalid validator syntax                                |
-| `TSB012` | Invalid validator member                                |
-| `TSB013` | Invalid step overload syntax                            |
-| `TSB014` | Invalid step overload member                            |
-| `TSB015` | Duplicate generated step overload method                |
-| `TSB016` | Multiple parameterless step overloads are not supported |
-
----
-
-## Why use it
-
-### Strong compile-time guarantees
-
-* cannot call `Build()` prematurely
-* cannot forget required steps
-* cannot call steps multiple times
-
-### Flexible API design
-
-* steps in **any order**
-* no rigid step chaining
-* supports generics and multiple build paths
-* supports multiple generated input forms for the same logical step
-
-### Built-in capabilities
-
-* optional values with defaults
-* centralized validation
-* exception aggregation
-* overload-based value construction for steps
-
-### Clean encapsulation
-
-* works with **private members**
-* no need to expose internals
-
-### Reduced boilerplate
-
-* no step interfaces
-* no manual validation wiring
-* no manual forwarding overload methods in the fluent API
-* no runtime guards for structural correctness
 
 ---
 
 ## Summary
 
-TypedStateBuilder generates a **compile-time verified builder API** that combines:
+TypedStateBuilder generates a builder API where:
 
-* **flexibility** (steps in any order)
-* **safety** (required steps enforced by the compiler)
-* **simplicity** (no manual type-state boilerplate)
+* required steps are enforced at compile time
+* invalid construction paths cannot be expressed
+* ordering remains flexible where valid
+* branching enables multiple safe build paths
 
-It supports:
-
-* required and optional steps
-* validation
-* multiple build methods
-* constructor-based creation
-* step overload generation
-
-All while letting you define builders in plain, idiomatic C#.
+You define a builder. The generator makes its correct usage explicit.

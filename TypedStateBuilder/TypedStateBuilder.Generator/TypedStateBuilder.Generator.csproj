@@ -18,7 +18,7 @@
         <PackageReadmeFile>Readme.md</PackageReadmeFile>
         <PackageTags>SourceGenerator;Roslyn;TypedStateBuilder;FluentBuilder;TypeState</PackageTags>
         <PackageLicenseExpression>MIT</PackageLicenseExpression>
-        <Version>1.1.0</Version>
+        <Version>1.2.0</Version>
         <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     </PropertyGroup>
